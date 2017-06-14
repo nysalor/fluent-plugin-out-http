@@ -32,6 +32,8 @@ class Fluent::HTTPOutput < Fluent::Output
   config_param :username, :string, :default => ''
   config_param :password, :string, :default => '', :secret => true
 
+  config_param :reuse_limit, :integer, default: 1000
+
   def configure(conf)
     super
 
@@ -61,6 +63,8 @@ class Fluent::HTTPOutput < Fluent::Output
               :none
             end
 
+    @connection_count = 0
+
     @last_request_time = nil
   end
 
@@ -72,11 +76,15 @@ class Fluent::HTTPOutput < Fluent::Output
     super
   end
 
-  def format_url(tag, time, record)
+  def format_url
     @endpoint_url
   end
 
-  def set_body(req, tag, time, record)
+  def format_uri
+    @format_uri ||= URI.parse(format_url)
+  end
+
+  def set_body(req, _tag, _time, record)
     if @serializer == :json
       set_json_body(req, record)
     else
@@ -85,7 +93,7 @@ class Fluent::HTTPOutput < Fluent::Output
     req
   end
 
-  def set_header(req, tag, time, record)
+  def set_header(req, _tag, _time, _record)
     req
   end
 
@@ -95,23 +103,35 @@ class Fluent::HTTPOutput < Fluent::Output
   end
 
   def create_request(tag, time, record)
-    url = format_url(tag, time, record)
-    uri = URI.parse(url)
-    req = Net::HTTP.const_get(@http_method.to_s.capitalize).new(uri.path)
+    req = Net::HTTP.const_get(@http_method.to_s.capitalize).new(format_uri.path)
     set_body(req, tag, time, record)
     set_header(req, tag, time, record)
-    return req, uri
+    return req
   end
 
-  def http_opts(uri)
-      opts = {
-        :use_ssl => uri.scheme == 'https'
-      }
-      opts[:verify_mode] = @ssl_verify_mode if opts[:use_ssl]
-      opts
+  def connection
+    if @connection
+      if @connection_count > @reuse_limit
+        @connection.finish
+        create_connection
+      else
+        @connection
+      end
+    else
+      create_connection
+    end
   end
 
-  def send_request(req, uri)
+  def create_connection
+    @connection = Net::HTTP.start format_uri.host, format_uri.port
+    if format_uri.scheme == 'https'
+      @connection.use_ssl = true
+      @connection.ssl_verify_mode = @ssl_verify_mode
+    end
+    @connection
+  end
+
+  def send_request(req)
     is_rate_limited = (@rate_limit_msec != 0 and not @last_request_time.nil?)
     if is_rate_limited and ((Time.now.to_f - @last_request_time) * 1000.0 < @rate_limit_msec)
       $log.info('Dropped request due to rate limiting')
@@ -125,26 +145,27 @@ class Fluent::HTTPOutput < Fluent::Output
         req.basic_auth(@username, @password)
       end
       @last_request_time = Time.now.to_f
-      res = Net::HTTP.start(uri.host, uri.port, **http_opts(uri)) {|http| http.request(req) }
+      res = connection.request(req)
+      @connection_count += 1
     rescue => e # rescue all StandardErrors
       # server didn't respond
       $log.warn "Net::HTTP.#{req.method.capitalize} raises exception: #{e.class}, '#{e.message}'"
       raise e if @raise_on_error
     else
-       unless res and res.is_a?(Net::HTTPSuccess)
-          res_summary = if res
-                           "#{res.code} #{res.message} #{res.body}"
-                        else
-                           "res=nil"
-                        end
-          $log.warn "failed to #{req.method} #{uri} (#{res_summary})"
-       end #end unless
+      unless res and res.is_a?(Net::HTTPSuccess)
+        res_summary = if res
+                        "#{res.code} #{res.message} #{res.body}"
+                      else
+                        "res=nil"
+                      end
+        $log.warn "failed to #{req.method} #{uri} (#{res_summary})"
+      end #end unless
     end # end begin
   end # end send_request
 
   def handle_record(tag, time, record)
-    req, uri = create_request(tag, time, record)
-    send_request(req, uri)
+    req = create_request(tag, time, record)
+    send_request(req)
   end
 
   def emit(tag, es, chain)
